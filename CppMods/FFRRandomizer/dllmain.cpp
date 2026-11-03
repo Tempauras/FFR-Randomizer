@@ -25,8 +25,6 @@ using namespace RC::Unreal;
 
 namespace
 {
-    // Check if game rebuild list at runtime
-    constexpr float CheckSeconds = 1.0f;
     constexpr float SearchSeconds = 5.0f;
     constexpr float PanelSearchSeconds = 2.0f;
     constexpr const CharType* TableName = STR("DT_01Gra_40_01_Encount");
@@ -101,7 +99,7 @@ private:
 
     FWeakObjectPtr Area{};
     FWeakObjectPtr Panel{};
-    float SinceCheck{};
+    bool NeedsApply{};
     float SinceSearch{SearchSeconds};
     float SincePanelSearch{PanelSearchSeconds};
     bool HasLogged{};
@@ -138,7 +136,7 @@ private:
         if (!SeedRejected)
         {
             Seed = Parsed;
-            SinceCheck = CheckSeconds;
+            NeedsApply = true;
         }
         *Request = FString(STR(""));
         DisplayDirty = true;
@@ -146,7 +144,6 @@ private:
 
     auto TickArea(float DeltaSeconds) -> void
     {
-        SinceCheck += DeltaSeconds;
         SinceSearch += DeltaSeconds;
 
         UObject* Actor = Area.Get();
@@ -162,11 +159,11 @@ private:
             Actor = FindArea();
             if (!Actor) return;
             Area = Actor;
-            SinceCheck = CheckSeconds;
+            NeedsApply = true;
         }
 
-        if (SinceCheck < CheckSeconds) return;
-        SinceCheck = 0.0f;
+        if (!NeedsApply) return;
+        NeedsApply = false;
         Apply(Actor);
     }
 
