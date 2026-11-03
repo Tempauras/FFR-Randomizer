@@ -20,6 +20,10 @@ public class FFRSModTools : ModuleRules
 			"UMGEditor",
 			"Slate",
 			"SlateCore",
+			"CommonUI",
+			"CommonInput",
+			"GameplayTags",
+			"mucha",
 		});
 	}
 }
