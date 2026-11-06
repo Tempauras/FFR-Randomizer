@@ -74,7 +74,7 @@ $Editor = "$Engine\Binaries\Win64\UnrealEditor-Cmd.exe"
 $UnrealPak = "$Engine\Binaries\Win64\UnrealPak.exe"
 $Cooked = "$Project\Saved\Cooked\Windows"
 $ModName = 'FFRRandomizer'
-$Assets = 'ModActor', 'WBP_SeedPanel'
+$Assets = @('WBP_SeedPanel')
 
 & "$Engine\Build\BatchFiles\Build.bat" FFRSEditor Win64 Development "-Project=$Uproject" -WaitMutex -NoHotReload | Select-String ': error|Result:'
 if ($LASTEXITCODE -ne 0) { throw 'The editor tool did not build' }
@@ -83,7 +83,7 @@ Remove-Item -LiteralPath "$Project\Content\Mods\$ModName" -Recurse -Force -Error
 & $Editor $Uproject -run=BuildFFRRandomizerUI -unattended -nop4 -nosplash -stdout -AllowStdOutLogVerbosity | Select-String 'LogFFRRandomizerUI'
 if ($LASTEXITCODE -ne 0) { throw 'The assets were not generated' }
 
-$Packages = $Assets | ForEach-Object { "-PACKAGE=/Game/Mods/$ModName/$_" }
+$Packages = @($Assets | ForEach-Object { "-PACKAGE=/Game/Mods/$ModName/$_" })
 & $Editor $Uproject -run=Cook -TargetPlatform=Windows -unattended -nop4 -nosplash -unversioned -cooksinglepackage @Packages -stdout -AllowStdOutLogVerbosity |
     Select-String 'Success - |Failure - '
 if ($LASTEXITCODE -ne 0) { throw 'The cook failed' }
@@ -116,6 +116,13 @@ $Dist = "$Project\Dist\$ModName"
 New-Item -ItemType Directory -Force $Dist | Out-Null
 foreach ($Extension in 'pak', 'ucas', 'utoc') { Copy-Item "$Work/$ModName.$Extension" $Dist -Force }
 
-if ($Install) { Copy-Item "$Dist\$ModName.*" "$GameDir\FFRS\Content\Paks\LogicMods" -Force }
+if ($Install) {
+    # The panel is loaded by the DLL, so the pak goes in ~mods, which the engine mounts on its own. An older install
+    # in LogicMods is removed so the same assets are not mounted twice.
+    $Mods = "$GameDir\FFRS\Content\Paks\~mods"
+    New-Item -ItemType Directory -Force $Mods | Out-Null
+    Copy-Item "$Dist\$ModName.*" $Mods -Force
+    Remove-Item "$GameDir\FFRS\Content\Paks\LogicMods\$ModName.*" -Force -ErrorAction SilentlyContinue
+}
 Get-ChildItem $Dist | Select-Object Name, Length
 exit 0

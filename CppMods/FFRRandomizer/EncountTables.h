@@ -1,6 +1,6 @@
 #pragma once
 
-// Every zone encounter table the game ships.
+// Every zone encounter table the game ships
 static constexpr const wchar_t* EncountTables[] = {
     L"/Game/Datatable/Encount/01Gra/DT_01Gra_40_01_Encount.DT_01Gra_40_01_Encount",
     L"/Game/Datatable/Encount/01Gra/DT_01Gra_40_02_Encount.DT_01Gra_40_02_Encount",

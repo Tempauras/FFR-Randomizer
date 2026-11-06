@@ -6,11 +6,11 @@ Intermediate/
 Saved/
 Dist/
 CppMods/build/
+# Local machine paths
 Tools/BuildPaths.local.json
 .vs/
 *.sln
 *.slnx
 *.bak
-
-# Local machine paths
-Tools/BuildPaths.local.json
+__pycache__/
+Tools/Scaling/

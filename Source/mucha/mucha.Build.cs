@@ -14,6 +14,9 @@ public class mucha : ModuleRules
 			"CoreUObject",
 			"Engine",
 			"GameplayTags",
+			"UMG",
+			"CommonUI",
+			"EnhancedUI",
 		});
 	}
 }

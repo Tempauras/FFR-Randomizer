@@ -18,35 +18,33 @@
 #include "Components/NamedSlot.h"
 #include "Components/Overlay.h"
 #include "Components/OverlaySlot.h"
-#include "Components/ScrollBox.h"
+#include "Components/Spacer.h"
 #include "Components/SizeBox.h"
 #include "Components/TextBlock.h"
 #include "Components/VerticalBox.h"
 #include "Components/VerticalBoxSlot.h"
 #include "CPP_SoundSubsystem.h"
+#include "CPP_WBP_MuchaActivatable.h"
 #include "EdGraphSchema_K2.h"
 #include "Engine/Blueprint.h"
-#include "Engine/BlueprintGeneratedClass.h"
 #include "Engine/Font.h"
 #include "Engine/Texture2D.h"
-#include "GameFramework/Actor.h"
+#include "Materials/Material.h"
 #include "GameFramework/PlayerController.h"
 #include "K2Node_CallFunction.h"
+#include "K2Node_CallParentFunction.h"
 #include "K2Node_ComponentBoundEvent.h"
 #include "K2Node_CustomEvent.h"
 #include "K2Node_DynamicCast.h"
 #include "K2Node_Event.h"
-#include "K2Node_FunctionEntry.h"
-#include "K2Node_FunctionResult.h"
 #include "K2Node_GetSubsystem.h"
 #include "K2Node_IfThenElse.h"
 #include "K2Node_Self.h"
-#include "K2Node_SwitchEnum.h"
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
 #include "Kismet/GameplayStatics.h"
-#include "Kismet/KismetInputLibrary.h"
 #include "Kismet/KismetMathLibrary.h"
+#include "Kismet/KismetStringLibrary.h"
 #include "Kismet/KismetTextLibrary.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
@@ -66,6 +64,12 @@ namespace
 	const TCHAR* const CursorTexture = TEXT("/Game/UI/Textures/Menu/MenuIcon_FingerCursor_R.MenuIcon_FingerCursor_R");
 	const TCHAR* const ButtonTexture = TEXT("/Game/UI/Textures/Menu/T_Dialog_Default.T_Dialog_Default");
 	const TCHAR* const ButtonSelectTexture = TEXT("/Game/UI/Textures/Menu/T_Dialog_Select.T_Dialog_Select");
+	// The game's settings mark the chosen side of a choice with these (WBP_OP_RadioButtonParts): the light,
+	// tinted, in a 40 high box, and a 2 high white line along its foot.
+	const TCHAR* const ChoiceLightMaterial = TEXT("/Game/UI/Textures/Menu/M_menu_Tab_Cursor_Light");
+	const TCHAR* const WhiteTexture = TEXT("/Game/UI/Textures/Menu/T_Menu_white.T_Menu_white");
+	const FLinearColor ChoiceLightTint(0.015996f, 0.14996f, 0.300544f, 1.f);
+	constexpr float ChoiceLightHeight = 40.f;
 	const TCHAR* const SystemFont = TEXT("/Game/UI/Font/SystemText.SystemText");
 	const TCHAR* const SystemTextStyle = TEXT("/Game/UI/Common/Text/TextStyle/SystemText/BP_SystemTextStyle.BP_SystemTextStyle_C");
 
@@ -73,30 +77,71 @@ namespace
 	// stand-in's property layout rather than the game's.
 	const TCHAR* const TitleWindowPackage = TEXT("/Game/UI/Common/Layout/Panel/WBP_TitlePanelLayout");
 	const TCHAR* const RowLabelPackage = TEXT("/Game/UI/Common/Button/LeftLine/Widget/WBP_LeftLineButton");
+	// The darkening the game's screens lay over the field behind them.
+	const TCHAR* const DimmingPackage = TEXT("/Game/UI/Common/Layout/WBP_BGDimming");
 
-	// The space the window's frame and title leave for content.
-	const FVector2D WindowSize(1800.f, 760.f);
+	// The prompts the game shows at the bottom right while the panel is on top.
+	const TCHAR* const ActionGuideTag = TEXT("UI.System.ActionGuide.Declare.Common.Close");
+
+	// The space the window's frame and title leave for content, around the seed column.
 	const FMargin WindowInside(211.f, 125.f, 211.f, 110.f);
 
-	const FLinearColor ValueFill(0.f, 0.f, 0.f, 0.7f);
-	const FLinearColor HintColor(0.55f, 0.72f, 0.85f, 0.9f);
+	// The value strips' dark teal, from the game's settings rows.
+	const FLinearColor ValueFill(FColor(12, 22, 27, 235));
 	constexpr float RowHeight = 50.f;
-	constexpr float LabelWidth = 300.f;
-	constexpr float SeedColumnWidth = 680.f;
+	constexpr float LabelWidth = 340.f;
+	constexpr float SeedColumnWidth = 1100.f;
+	// The options that share a line, two by two in their order (battles and bosses, then their scalings): each half
+	// has a shorter label, with this gap between the halves.
+	constexpr int32 PairedOptions = 4;
+	constexpr float HalfLabelWidth = 285.f;
+	constexpr float PairGap = 16.f;
+	constexpr float HalfWidth = (SeedColumnWidth - PairGap) / 2.f;
+	// The other options' rows, centred under the pairs.
+	constexpr float CentredRowWidth = 600.f;
 	constexpr float CursorSize = 34.f;
+	const FVector2D WindowSize(WindowInside.Left + SeedColumnWidth + WindowInside.Right, 1060.f);
 
-	// The zone lists' entries are made in advance; the DLL names the ones it needs and hides the
-	// rest. Kind is what ChooseZone passes on.
-	struct FZoneListKind
+	// The DLL's options, in its order. On and Off call Choose with these kinds; the DLL shows the mark
+	// under the current choice.
+	const TCHAR* const OptionNames[] = {
+		TEXT("Normal battles"), TEXT("Boss battles"), TEXT("Normal scaling"), TEXT("Boss scaling"),
+		TEXT("Enemy drops and steals"), TEXT("Chests"), TEXT("Shops"), TEXT("Visions"),
+	};
+	constexpr int32 OptionOnKind = 3;
+	constexpr int32 OptionOffKind = 4;
+	constexpr float ChoiceWidth = 120.f;
+	// Rows that choose from a list instead of On and Off: the option's row, its widgets' prefix, its choices and
+	// the Choose kind an entry sends with its index. The DLL writes the bar's text and marks the current entry.
+	struct FDropdown
 	{
-		const TCHAR* Name;
+		int32 Option;
+		const TCHAR* Prefix;
+		TArray<const TCHAR*> Choices;
 		int32 Kind;
-		int32 Entries;
 	};
-	const FZoneListKind ZoneLists[] = {
-		{TEXT("Dungeon"), 1, 64},
-		{TEXT("Field"), 2, 96},
+	const FDropdown Dropdowns[] = {
+		{2, TEXT("Scaling"), {TEXT("Off"), TEXT("Replaced stats"), TEXT("Balanced")}, 6},
+		{3, TEXT("BossScaling"), {TEXT("Off"), TEXT("Replaced stats"), TEXT("Balanced")}, 7},
+		{4, TEXT("Loot"), {TEXT("Off"), TEXT("Drops"), TEXT("Steals"), TEXT("Both"), TEXT("Mixed")}, 5},
 	};
+
+	const FDropdown* DropdownFor(int32 Option)
+	{
+		for (const FDropdown& Dropdown : Dropdowns)
+		{
+			if (Dropdown.Option == Option) return &Dropdown;
+		}
+		return nullptr;
+	}
+
+	// The game's menu input, queued for the DLL in PendingInput as numbers: 100 + direction * 10 for
+	// InputDirection (EUINavigation: Left, Right, Up, Down), 200 for InputDecide, 300 for InputCancel and
+	// 400 for InputEscape, each plus the EWidgetInputEventType, and a comma after each.
+	constexpr int32 InputDirectionCode = 100;
+	constexpr int32 InputDecideCode = 200;
+	constexpr int32 InputCancelCode = 300;
+	constexpr int32 InputEscapeCode = 400;
 
 	const TCHAR* const SoundOpen = TEXT("Sound.UI.Common.Open");
 	const TCHAR* const SoundClose = TEXT("Sound.UI.Cancel");
@@ -193,15 +238,6 @@ namespace
 			return Node;
 		}
 
-		UK2Node_SwitchEnum* Switch(UEnum* Enum)
-		{
-			FGraphNodeCreator<UK2Node_SwitchEnum> Creator(*Graph);
-			UK2Node_SwitchEnum* Node = Creator.CreateNode();
-			Node->SetEnum(Enum);
-			Creator.Finalize();
-			return Node;
-		}
-
 		UK2Node_DynamicCast* CastTo(UClass* Class)
 		{
 			FGraphNodeCreator<UK2Node_DynamicCast> Creator(*Graph);
@@ -235,16 +271,6 @@ namespace
 			Literal(Play, TEXT("P1"), FString::Printf(TEXT("(TagName=\"%s\")"), Tag));
 			Link(Self(), UEdGraphSchema_K2::PN_Self, Play, TEXT("P3"));
 			return Play;
-		}
-
-		template<typename NodeType>
-		NodeType* Find() const
-		{
-			for (UEdGraphNode* Node : Graph->Nodes)
-			{
-				if (NodeType* Found = Cast<NodeType>(Node)) return Found;
-			}
-			throw FBuildError{FString::Printf(TEXT("%s has no %s"), *Graph->GetName(), *NodeType::StaticClass()->GetName())};
 		}
 
 		static UEdGraphPin* Pin(UEdGraphNode* Node, FName Name)
@@ -295,27 +321,6 @@ namespace
 		UEdGraph* Graph;
 	};
 
-	UK2Node_Event* EnabledBeginPlay(UBlueprint* Blueprint, UEdGraph* Graph)
-	{
-		TArray<UK2Node_Event*> Events;
-		FBlueprintEditorUtils::GetAllNodesOfClass(Blueprint, Events);
-		for (UK2Node_Event* Event : Events)
-		{
-			if (Event->EventReference.GetMemberName() == TEXT("ReceiveBeginPlay"))
-			{
-				Event->SetEnabledState(ENodeEnabledState::Enabled, false);
-				return Event;
-			}
-		}
-
-		FGraphNodeCreator<UK2Node_Event> Creator(*Graph);
-		UK2Node_Event* Event = Creator.CreateNode();
-		Event->EventReference.SetExternalMember(TEXT("ReceiveBeginPlay"), AActor::StaticClass());
-		Event->bOverrideFunction = true;
-		Creator.Finalize();
-		return Event;
-	}
-
 	UK2Node_Event* OverrideEvent(UEdGraph* Graph, UClass* Owner, FName Function)
 	{
 		FGraphNodeCreator<UK2Node_Event> Creator(*Graph);
@@ -341,17 +346,6 @@ namespace
 		return Event;
 	}
 
-	UEdGraph* OverrideFunction(UBlueprint* Blueprint, UClass* Owner, FName Function)
-	{
-		if (!Owner->FindFunctionByName(Function))
-		{
-			throw FBuildError{FString::Printf(TEXT("%s has no function %s to override"), *Owner->GetName(), *Function.ToString())};
-		}
-		UEdGraph* Graph = FBlueprintEditorUtils::CreateNewGraph(Blueprint, Function, UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
-		FBlueprintEditorUtils::AddFunctionGraph<UClass>(Blueprint, Graph, false, Owner);
-		return Graph;
-	}
-
 	UPackage* NewAssetPackage(const FString& AssetName)
 	{
 		const FString Path = FString(ModFolder) + AssetName;
@@ -362,6 +356,20 @@ namespace
 		return CreatePackage(*Path);
 	}
 
+	void SaveAsset(UObject* Asset)
+	{
+		UPackage* Package = Asset->GetOutermost();
+		Package->MarkPackageDirty();
+		FSavePackageArgs Args;
+		Args.TopLevelFlags = RF_Public | RF_Standalone;
+		const FString File = FPackageName::LongPackageNameToFilename(Package->GetName(), FPackageName::GetAssetPackageExtension());
+		if (!UPackage::SavePackage(Package, Asset, *File, Args))
+		{
+			throw FBuildError{TEXT("could not save ") + File};
+		}
+		UE_LOG(LogFFRRandomizerUI, Display, TEXT("Saved %s"), *File);
+	}
+
 	void CompileAndSave(UBlueprint* Blueprint)
 	{
 		FKismetEditorUtilities::CompileBlueprint(Blueprint);
@@ -370,16 +378,22 @@ namespace
 			throw FBuildError{Blueprint->GetName() + TEXT(" did not compile")};
 		}
 
-		UPackage* Package = Blueprint->GetOutermost();
-		Package->MarkPackageDirty();
-		FSavePackageArgs Args;
-		Args.TopLevelFlags = RF_Public | RF_Standalone;
-		const FString File = FPackageName::LongPackageNameToFilename(Package->GetName(), FPackageName::GetAssetPackageExtension());
-		if (!UPackage::SavePackage(Package, Blueprint, *File, Args))
+		SaveAsset(Blueprint);
+	}
+
+	// An editor stand-in for a game material at its shipped path, made once and never packed: a plain UI material.
+	UMaterialInterface* StandInMaterial(const TCHAR* PackagePath)
+	{
+		const FString AssetName = FPackageName::GetLongPackageAssetName(PackagePath);
+		if (FPackageName::DoesPackageExist(PackagePath))
 		{
-			throw FBuildError{TEXT("could not save ") + File};
+			return LoadAsset<UMaterialInterface>(*(FString(PackagePath) + TEXT(".") + AssetName));
 		}
-		UE_LOG(LogFFRRandomizerUI, Display, TEXT("Saved %s"), *File);
+		UMaterial* Material = NewObject<UMaterial>(CreatePackage(PackagePath), *AssetName, RF_Public | RF_Standalone);
+		Material->MaterialDomain = MD_UI;
+		Material->PostEditChange();
+		SaveAsset(Material);
+		return Material;
 	}
 
 	// An editor stand-in for a game widget Blueprint at its shipped path, made once and never packed.
@@ -433,15 +447,18 @@ namespace
 
 	UWidgetBlueprint* BuildPanel()
 	{
+		// A game screen: pushed on the game's layer stack, it gets the game's menu input and prompts.
 		UWidgetBlueprint* Blueprint = CastChecked<UWidgetBlueprint>(FKismetEditorUtilities::CreateBlueprint(
-			UUserWidget::StaticClass(), NewAssetPackage(TEXT("WBP_SeedPanel")), TEXT("WBP_SeedPanel"), BPTYPE_Normal,
+			UCPP_WBP_MuchaActivatable::StaticClass(), NewAssetPackage(TEXT("WBP_SeedPanel")), TEXT("WBP_SeedPanel"), BPTYPE_Normal,
 			UWidgetBlueprint::StaticClass(), UWidgetBlueprintGeneratedClass::StaticClass()));
 
 		UFont* Font = LoadAsset<UFont>(SystemFont);
 		UClass* Style = LoadAsset<UClass>(SystemTextStyle);
-		UTexture2D* Finger = LoadAsset<UTexture2D>(CursorTexture);
+		UTexture2D* FingerImage = LoadAsset<UTexture2D>(CursorTexture);
 		UTexture2D* ButtonImage = LoadAsset<UTexture2D>(ButtonTexture);
 		UTexture2D* ButtonSelectImage = LoadAsset<UTexture2D>(ButtonSelectTexture);
+		UMaterialInterface* ChoiceLight = StandInMaterial(ChoiceLightMaterial);
+		UTexture2D* White = LoadAsset<UTexture2D>(WhiteTexture);
 
 		const FName TitleText(TEXT("TitleText"));
 		UClass* TitleWindow = StandInWidget(TitleWindowPackage, [TitleText](UWidgetBlueprint* StandIn)
@@ -451,10 +468,31 @@ namespace
 			FBlueprintEditorUtils::AddMemberVariable(StandIn, TitleText, TextType);
 		});
 		UClass* RowLabel = StandInWidget(RowLabelPackage, [](UWidgetBlueprint*) {});
+		UClass* Dimming = StandInWidget(DimmingPackage, [](UWidgetBlueprint*) {});
 
 		UWidgetTree* Tree = Blueprint->WidgetTree;
 		UCanvasPanel* Root = Tree->ConstructWidget<UCanvasPanel>(UCanvasPanel::StaticClass(), TEXT("Root"));
 		Tree->RootWidget = Root;
+
+		// The game's dimming fills DimHost at run time, under everything else.
+		USizeBox* DimHost = Tree->ConstructWidget<USizeBox>(USizeBox::StaticClass(), TEXT("DimHost"));
+		DimHost->bIsVariable = true;
+		UCanvasPanelSlot* DimSlot = Root->AddChildToCanvas(DimHost);
+		DimSlot->SetAnchors(FAnchors(0.f, 0.f, 1.f, 1.f));
+		DimSlot->SetOffsets(FMargin(0.f));
+
+		// The finger that points at what the controller is on, left of it; the DLL shows one at a time.
+		const auto AddFinger = [&](UOverlay* Into, const FString& Name)
+		{
+			UImage* Finger = Tree->ConstructWidget<UImage>(UImage::StaticClass(), *(Name + TEXT("Finger")));
+			Finger->bIsVariable = true;
+			Finger->SetBrush(TextureBrush(FingerImage, FVector2D(CursorSize)));
+			Finger->SetVisibility(ESlateVisibility::Collapsed);
+			Finger->SetRenderTransform(FWidgetTransform(FVector2D(-CursorSize - 10.f, 0.f), FVector2D(1.f), FVector2D::ZeroVector, 0.f));
+			UOverlaySlot* FingerSlot = Into->AddChildToOverlay(Finger);
+			FingerSlot->SetHorizontalAlignment(HAlign_Left);
+			FingerSlot->SetVerticalAlignment(VAlign_Center);
+		};
 
 		// The game's titled window fills WindowHost at run time; the content lies over it.
 		UOverlay* Window = Tree->ConstructWidget<UOverlay>(UOverlay::StaticClass(), TEXT("Window"));
@@ -469,20 +507,14 @@ namespace
 		HostSlot->SetHorizontalAlignment(HAlign_Fill);
 		HostSlot->SetVerticalAlignment(VAlign_Fill);
 
-		UHorizontalBox* Columns = Tree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass(), TEXT("Columns"));
-		UOverlaySlot* ColumnsSlot = Window->AddChildToOverlay(Columns);
-		ColumnsSlot->SetPadding(WindowInside);
-		ColumnsSlot->SetHorizontalAlignment(HAlign_Fill);
-		ColumnsSlot->SetVerticalAlignment(VAlign_Fill);
-
 		UVerticalBox* Box = Tree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), TEXT("Box"));
 		USizeBox* SeedColumn = Tree->ConstructWidget<USizeBox>(USizeBox::StaticClass(), TEXT("SeedColumn"));
 		SeedColumn->SetWidthOverride(SeedColumnWidth);
 		SeedColumn->SetContent(Box);
-		Columns->AddChildToHorizontalBox(SeedColumn)->SetPadding(FMargin(0.f, 0.f, 36.f, 0.f));
-
-		UVerticalBox* ZonesColumn = Tree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), TEXT("ZonesColumn"));
-		Columns->AddChildToHorizontalBox(ZonesColumn)->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+		UOverlaySlot* ColumnSlot = Window->AddChildToOverlay(SeedColumn);
+		ColumnSlot->SetPadding(WindowInside);
+		ColumnSlot->SetHorizontalAlignment(HAlign_Fill);
+		ColumnSlot->SetVerticalAlignment(VAlign_Fill);
 
 		const auto AddHeader = [&](UVerticalBox* Column, const FString& Name, const FString& Text)
 		{
@@ -500,75 +532,11 @@ namespace
 			HeaderBox->SetContent(Header);
 			Column->AddChildToVerticalBox(HeaderBox)->SetPadding(FMargin(0.f, 0.f, 0.f, 10.f));
 		};
-		AddHeader(Box, TEXT("Seed"), TEXT("- Battle encounters"));
-		AddHeader(ZonesColumn, TEXT("Zones"), TEXT("- Zones"));
+		AddHeader(Box, TEXT("Seed"), TEXT("- Seed"));
 
-		const auto StyleScroll = [](UScrollBox* Scroll)
+		// A list entry: a clear button that lights up under the cursor.
+		const auto ListItemStyle = []()
 		{
-			FScrollBarStyle Bar = Scroll->GetWidgetBarStyle();
-			FSlateBrush Track;
-			Track.TintColor = FSlateColor(FLinearColor(0.f, 0.02f, 0.04f, 0.8f));
-			Bar.SetVerticalBackgroundImage(Track);
-			FSlateBrush Thumb;
-			Thumb.TintColor = FSlateColor(FLinearColor(0.004f, 0.571f, 1.f, 0.9f));
-			Bar.SetNormalThumbImage(Thumb);
-			Thumb.TintColor = FSlateColor(FLinearColor(0.2f, 0.7f, 1.f, 1.f));
-			Bar.SetHoveredThumbImage(Thumb);
-			Bar.SetDraggedThumbImage(Thumb);
-			Scroll->SetWidgetBarStyle(Bar);
-			Scroll->SetScrollbarThickness(FVector2D(8.f));
-			Scroll->SetAlwaysShowScrollbar(true);
-		};
-
-		// The zone choosers open lists drawn inside the panel rather than popups, so the finger cursor
-		// stays over them and each keeps its scroll.
-		for (const FZoneListKind& List : ZoneLists)
-		{
-			const FString Name(List.Name);
-			UButton* Select = Tree->ConstructWidget<UButton>(UButton::StaticClass(), *(Name + TEXT("Select")));
-			Select->bIsVariable = true;
-			FButtonStyle Bar = Select->GetStyle();
-			Bar.SetNormal(TextureBrush(ButtonImage, FVector2D(512.f, 32.f), ESlateBrushDrawType::Box, 0.5f));
-			Bar.SetHovered(TextureBrush(ButtonSelectImage, FVector2D(512.f, 32.f), ESlateBrushDrawType::Box, 0.5f));
-			Bar.SetPressed(TextureBrush(ButtonSelectImage, FVector2D(512.f, 32.f), ESlateBrushDrawType::Box, 0.5f));
-			Bar.SetNormalPadding(FMargin(16.f, 0.f));
-			Bar.SetPressedPadding(FMargin(16.f, 0.f));
-			Select->SetStyle(Bar);
-			UHorizontalBox* SelectRow = Tree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass(), *(Name + TEXT("SelectRow")));
-			UCommonTextBlock* SelectText = GameText(Tree, Style, *(Name + TEXT("SelectText")), TEXT(""));
-			SelectText->bIsVariable = true;
-			UHorizontalBoxSlot* NameSlot = SelectRow->AddChildToHorizontalBox(SelectText);
-			NameSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
-			NameSlot->SetVerticalAlignment(VAlign_Center);
-			SelectRow->AddChildToHorizontalBox(GameText(Tree, Style, *(Name + TEXT("SelectArrow")), TEXT("\u25BC")))->SetVerticalAlignment(VAlign_Center);
-			Select->SetContent(SelectRow);
-			CastChecked<UButtonSlot>(SelectRow->Slot)->SetHorizontalAlignment(HAlign_Fill);
-			USizeBox* SelectBox = Tree->ConstructWidget<USizeBox>(USizeBox::StaticClass(), *(Name + TEXT("SelectBox")));
-			SelectBox->SetHeightOverride(RowHeight);
-			SelectBox->SetContent(Select);
-			ZonesColumn->AddChildToVerticalBox(SelectBox)->SetPadding(FMargin(0.f, 0.f, 0.f, 8.f));
-		}
-
-		// The shown zone's battles, with the open list, if any, over them.
-		{
-			UOverlay* ZoneArea = Tree->ConstructWidget<UOverlay>(UOverlay::StaticClass(), TEXT("ZoneArea"));
-			ZonesColumn->AddChildToVerticalBox(ZoneArea)->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
-
-			UScrollBox* Scroll = Tree->ConstructWidget<UScrollBox>(UScrollBox::StaticClass(), TEXT("ZoneScroll"));
-			Scroll->bIsVariable = true;
-			StyleScroll(Scroll);
-			UCommonTextBlock* ZoneList = GameText(Tree, Style, TEXT("ZoneList"), TEXT("Shown once a save is loaded."));
-			ZoneList->bIsVariable = true;
-			ZoneList->SetAutoWrapText(true);
-			Scroll->AddChild(ZoneList);
-			UBorder* Strip = Tree->ConstructWidget<UBorder>(UBorder::StaticClass(), TEXT("ZoneStrip"));
-			Strip->SetBrushColor(ValueFill);
-			Strip->SetPadding(FMargin(24.f, 12.f, 8.f, 12.f));
-			Strip->SetContent(Scroll);
-			UOverlaySlot* StripSlot = ZoneArea->AddChildToOverlay(Strip);
-			StripSlot->SetHorizontalAlignment(HAlign_Fill);
-			StripSlot->SetVerticalAlignment(VAlign_Fill);
-
 			FButtonStyle Item = GetDefault<UButton>()->GetStyle();
 			FSlateBrush Clear;
 			Clear.TintColor = FSlateColor(FLinearColor(0.f, 0.f, 0.f, 0.f));
@@ -578,42 +546,15 @@ namespace
 			Down.TintColor = FSlateColor(FLinearColor(0.004f, 0.571f, 1.f, 0.6f));
 			Item.SetNormal(Clear).SetHovered(Lit).SetPressed(Down);
 			Item.SetNormalPadding(FMargin(16.f, 4.f)).SetPressedPadding(FMargin(16.f, 4.f));
-			for (const FZoneListKind& List : ZoneLists)
-			{
-				const FString Name(List.Name);
-				UScrollBox* MenuScroll = Tree->ConstructWidget<UScrollBox>(UScrollBox::StaticClass(), *(Name + TEXT("MenuScroll")));
-				MenuScroll->bIsVariable = true;
-				StyleScroll(MenuScroll);
-				for (int32 Index = 0; Index < List.Entries; ++Index)
-				{
-					UButton* Entry = Tree->ConstructWidget<UButton>(UButton::StaticClass(), *FString::Printf(TEXT("%sItem%d"), List.Name, Index));
-					Entry->bIsVariable = true;
-					Entry->SetStyle(Item);
-					// Not focusable: a focused entry scrolls its list to itself.
-					FindFProperty<FBoolProperty>(UButton::StaticClass(), TEXT("IsFocusable"))->SetPropertyValue_InContainer(Entry, false);
-					UCommonTextBlock* EntryText = GameText(Tree, Style, *FString::Printf(TEXT("%sItemText%d"), List.Name, Index), TEXT(""));
-					EntryText->bIsVariable = true;
-					Entry->SetContent(EntryText);
-					MenuScroll->AddChild(Entry);
-					if (UButtonSlot* InButton = Cast<UButtonSlot>(EntryText->Slot)) InButton->SetHorizontalAlignment(HAlign_Left);
-				}
-				UBorder* Menu = Tree->ConstructWidget<UBorder>(UBorder::StaticClass(), *(Name + TEXT("Menu")));
-				Menu->bIsVariable = true;
-				Menu->SetBrushColor(FLinearColor(0.f, 0.02f, 0.04f, 1.f));
-				Menu->SetPadding(FMargin(4.f, 6.f, 8.f, 6.f));
-				Menu->SetContent(MenuScroll);
-				Menu->SetVisibility(ESlateVisibility::Collapsed);
-				UOverlaySlot* MenuSlot = ZoneArea->AddChildToOverlay(Menu);
-				MenuSlot->SetHorizontalAlignment(HAlign_Fill);
-				MenuSlot->SetVerticalAlignment(VAlign_Fill);
-			}
-		}
+			return Item;
+		};
 
 		// An option row: the game's row label (created at run time into LabelHost) and a value strip.
 		TArray<FName> LabelHosts;
-		const auto AddRow = [&](FName Name, const FString& Caption, UWidget* Value)
+		const auto MakeRow = [&](FName Name, const FString& Caption, UWidget* Value, float RowLabelWidth, FMargin Inset)
 		{
 			UHorizontalBox* Row = Tree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass(), Name);
+			Row->bIsVariable = true;
 
 			UOverlay* Label = Tree->ConstructWidget<UOverlay>(UOverlay::StaticClass(), *(Name.ToString() + TEXT("Label")));
 			const FName HostName(*(Name.ToString() + TEXT("LabelHost")));
@@ -627,8 +568,9 @@ namespace
 			UOverlaySlot* CaptionSlot = Label->AddChildToOverlay(CaptionText);
 			CaptionSlot->SetPadding(FMargin(22.f, 0.f, 8.f, 0.f));
 			CaptionSlot->SetVerticalAlignment(VAlign_Center);
+			AddFinger(Label, Name.ToString());
 			USizeBox* LabelBox = Tree->ConstructWidget<USizeBox>(USizeBox::StaticClass(), *(Name.ToString() + TEXT("LabelBox")));
-			LabelBox->SetWidthOverride(LabelWidth);
+			LabelBox->SetWidthOverride(RowLabelWidth);
 			LabelBox->SetMinDesiredHeight(RowHeight);
 			LabelBox->SetContent(Label);
 			Row->AddChildToHorizontalBox(LabelBox)->SetPadding(FMargin(0.f, 0.f, 2.f, 0.f));
@@ -636,13 +578,16 @@ namespace
 
 			UBorder* Strip = Tree->ConstructWidget<UBorder>(UBorder::StaticClass(), *(Name.ToString() + TEXT("Value")));
 			Strip->SetBrushColor(ValueFill);
-			Strip->SetPadding(FMargin(24.f, 6.f));
+			Strip->SetPadding(Inset);
 			Strip->SetVerticalAlignment(VAlign_Center);
 			Strip->SetContent(Value);
 			UHorizontalBoxSlot* StripSlot = Row->AddChildToHorizontalBox(Strip);
 			StripSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
-
-			Box->AddChildToVerticalBox(Row)->SetPadding(FMargin(0.f, 0.f, 0.f, 8.f));
+			return Row;
+		};
+		const auto AddRow = [&](FName Name, const FString& Caption, UWidget* Value, UVerticalBox* Into = nullptr, FMargin Inset = FMargin(24.f, 6.f))
+		{
+			(Into ? Into : Box)->AddChildToVerticalBox(MakeRow(Name, Caption, Value, LabelWidth, Inset))->SetPadding(FMargin(0.f, 0.f, 0.f, 8.f));
 		};
 
 		UCommonTextBlock* SeedLabel = GameText(Tree, Style, TEXT("SeedLabel"), TEXT("waiting for the mod's DLL"));
@@ -687,22 +632,194 @@ namespace
 			Box->AddChildToVerticalBox(ApplyBox)->SetPadding(FMargin(0.f, 2.f, 0.f, 10.f));
 		}
 
-		UTextBlock* Prompts = Tree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("Prompts"));
-		Prompts->SetText(FText::FromString(TEXT("Esc   Close        F2   Open and close")));
-		Prompts->SetFont(FSlateFontInfo(Font, 16));
-		Prompts->SetColorAndOpacity(FSlateColor(HintColor));
-		Prompts->SetShadowOffset(FVector2D(2.f, 1.f));
-		Prompts->SetShadowColorAndOpacity(FLinearColor(0.f, 0.f, 0.f, 0.5f));
-		UOverlaySlot* PromptSlot = Window->AddChildToOverlay(Prompts);
-		PromptSlot->SetPadding(FMargin(0.f, 0.f, WindowInside.Right, 52.f));
-		PromptSlot->SetHorizontalAlignment(HAlign_Right);
-		PromptSlot->SetVerticalAlignment(VAlign_Bottom);
+		// What the seed randomizes: a row per option, like the game's settings, with an On and an Off choice or a
+		// dropdown. The first PairedOptions share lines two by two.
+		AddHeader(Box, TEXT("Options"), TEXT("- Randomize"));
+		{
+			const FButtonStyle Item = ListItemStyle();
+
+			// A dropdown's bar, with the current choice.
+			const auto MakeBar = [&](const FDropdown& Dropdown)
+			{
+				const FString Prefix(Dropdown.Prefix);
+				UButton* Select = Tree->ConstructWidget<UButton>(UButton::StaticClass(), *(Prefix + TEXT("Select")));
+				Select->bIsVariable = true;
+				FButtonStyle Bar = Select->GetStyle();
+				FSlateBrush NoBar;
+				NoBar.TintColor = FSlateColor(FLinearColor(0.f, 0.f, 0.f, 0.f));
+				Bar.SetNormal(NoBar);
+				Bar.SetHovered(TextureBrush(ButtonSelectImage, FVector2D(512.f, 32.f), ESlateBrushDrawType::Box, 0.5f));
+				Bar.SetPressed(TextureBrush(ButtonSelectImage, FVector2D(512.f, 32.f), ESlateBrushDrawType::Box, 0.5f));
+				Bar.SetNormalPadding(FMargin(24.f, 0.f));
+				Bar.SetPressedPadding(FMargin(24.f, 0.f));
+				Select->SetStyle(Bar);
+				FindFProperty<FBoolProperty>(UButton::StaticClass(), TEXT("IsFocusable"))->SetPropertyValue_InContainer(Select, false);
+				UHorizontalBox* SelectRow = Tree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass(), *(Prefix + TEXT("SelectRow")));
+				UCommonTextBlock* SelectText = GameText(Tree, Style, *(Prefix + TEXT("SelectText")), Dropdown.Choices.Last());
+				SelectText->bIsVariable = true;
+				UHorizontalBoxSlot* NameSlot = SelectRow->AddChildToHorizontalBox(SelectText);
+				NameSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+				NameSlot->SetVerticalAlignment(VAlign_Center);
+				SelectRow->AddChildToHorizontalBox(GameText(Tree, Style, *(Prefix + TEXT("SelectArrow")), TEXT("\u25BC")))->SetVerticalAlignment(VAlign_Center);
+				Select->SetContent(SelectRow);
+				CastChecked<UButtonSlot>(SelectRow->Slot)->SetHorizontalAlignment(HAlign_Fill);
+				CastChecked<UButtonSlot>(SelectRow->Slot)->SetVerticalAlignment(VAlign_Fill);
+				return Select;
+			};
+
+			// A dropdown's list, collapsed until its bar opens it.
+			const auto MakeMenu = [&](const FDropdown& Dropdown)
+			{
+				const FString Prefix(Dropdown.Prefix);
+				UVerticalBox* List = Tree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), *(Prefix + TEXT("List")));
+				FButtonStyle Tight = Item;
+				Tight.SetNormalPadding(FMargin(16.f, 2.f)).SetPressedPadding(FMargin(16.f, 2.f));
+				for (int32 Choice = 0; Choice < Dropdown.Choices.Num(); ++Choice)
+				{
+					UButton* Entry = Tree->ConstructWidget<UButton>(UButton::StaticClass(), *FString::Printf(TEXT("%sItem%d"), *Prefix, Choice));
+					Entry->bIsVariable = true;
+					Entry->SetStyle(Tight);
+					FindFProperty<FBoolProperty>(UButton::StaticClass(), TEXT("IsFocusable"))->SetPropertyValue_InContainer(Entry, false);
+					UCommonTextBlock* EntryText = GameText(Tree, Style, *FString::Printf(TEXT("%sItemText%d"), *Prefix, Choice), Dropdown.Choices[Choice]);
+					EntryText->bIsVariable = true;
+					Entry->SetContent(EntryText);
+					List->AddChildToVerticalBox(Entry);
+					if (UButtonSlot* InButton = Cast<UButtonSlot>(EntryText->Slot)) InButton->SetHorizontalAlignment(HAlign_Left);
+				}
+				UBorder* Menu = Tree->ConstructWidget<UBorder>(UBorder::StaticClass(), *(Prefix + TEXT("Menu")));
+				Menu->bIsVariable = true;
+				Menu->SetBrushColor(FLinearColor(0.f, 0.02f, 0.04f, 1.f));
+				Menu->SetPadding(FMargin(4.f, 6.f, 8.f, 6.f));
+				Menu->SetContent(List);
+				Menu->SetVisibility(ESlateVisibility::Collapsed);
+				return Menu;
+			};
+
+			// An option's On and Off, with the mark on the chosen side.
+			const auto MakeChoices = [&](int32 Index)
+			{
+				UHorizontalBox* Choices = Tree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass(), *FString::Printf(TEXT("Option%dChoices"), Index));
+				Choices->AddChildToHorizontalBox(Tree->ConstructWidget<USpacer>(USpacer::StaticClass(), *FString::Printf(TEXT("Option%dSpace"), Index)))
+					->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+				for (const TCHAR* Choice : {TEXT("On"), TEXT("Off")})
+				{
+					const FString Name = FString::Printf(TEXT("Option%s%d"), Choice, Index);
+					UOverlay* Cell = Tree->ConstructWidget<UOverlay>(UOverlay::StaticClass(), *(Name + TEXT("Cell")));
+					// The mark on the chosen side, built like the game's settings: its light in a 40 high box with a
+					// white line along the foot, centred in the row.
+					UOverlay* Mark = Tree->ConstructWidget<UOverlay>(UOverlay::StaticClass(), *(Name + TEXT("Mark")));
+					Mark->bIsVariable = true;
+					Mark->SetVisibility(ESlateVisibility::Collapsed);
+					UImage* Light = Tree->ConstructWidget<UImage>(UImage::StaticClass(), *(Name + TEXT("Light")));
+					FSlateBrush LightBrush;
+					LightBrush.SetResourceObject(ChoiceLight);
+					Light->SetBrush(LightBrush);
+					Light->SetColorAndOpacity(ChoiceLightTint);
+					USizeBox* LightBox = Tree->ConstructWidget<USizeBox>(USizeBox::StaticClass(), *(Name + TEXT("LightBox")));
+					LightBox->SetHeightOverride(ChoiceLightHeight);
+					LightBox->SetContent(Light);
+					UOverlaySlot* LightSlot = Mark->AddChildToOverlay(LightBox);
+					LightSlot->SetHorizontalAlignment(HAlign_Fill);
+					LightSlot->SetVerticalAlignment(VAlign_Fill);
+					UImage* Line = Tree->ConstructWidget<UImage>(UImage::StaticClass(), *(Name + TEXT("Line")));
+					Line->SetBrush(TextureBrush(White, FVector2D(200.f, 2.f)));
+					UOverlaySlot* LineSlot = Mark->AddChildToOverlay(Line);
+					LineSlot->SetHorizontalAlignment(HAlign_Fill);
+					LineSlot->SetVerticalAlignment(VAlign_Bottom);
+					UOverlaySlot* MarkSlot = Cell->AddChildToOverlay(Mark);
+					MarkSlot->SetHorizontalAlignment(HAlign_Fill);
+					MarkSlot->SetVerticalAlignment(VAlign_Center);
+
+					UButton* Button = Tree->ConstructWidget<UButton>(UButton::StaticClass(), *(Name + TEXT("Button")));
+					Button->bIsVariable = true;
+					Button->SetStyle(Item);
+					FindFProperty<FBoolProperty>(UButton::StaticClass(), TEXT("IsFocusable"))->SetPropertyValue_InContainer(Button, false);
+					Button->SetContent(GameText(Tree, Style, *(Name + TEXT("Text")), Choice));
+					UOverlaySlot* ButtonSlot = Cell->AddChildToOverlay(Button);
+					ButtonSlot->SetHorizontalAlignment(HAlign_Fill);
+					ButtonSlot->SetVerticalAlignment(VAlign_Fill);
+
+					USizeBox* CellBox = Tree->ConstructWidget<USizeBox>(USizeBox::StaticClass(), *(Name + TEXT("Box")));
+					CellBox->SetWidthOverride(ChoiceWidth);
+					CellBox->SetContent(Cell);
+					Choices->AddChildToHorizontalBox(CellBox)->SetVerticalAlignment(VAlign_Fill);
+				}
+				return Choices;
+			};
+
+			const auto ValueOf = [&](int32 Index) -> UWidget*
+			{
+				if (const FDropdown* Dropdown = DropdownFor(Index)) return MakeBar(*Dropdown);
+				return MakeChoices(Index);
+			};
+
+			// The rows after a line with dropdowns share their space with its lists, which open over them: each list
+			// sits under its own bar, LeftInset from the column's left and Width wide.
+			UVerticalBox* Into = Box;
+			const auto OpenOver = [&](const FString& Name, const TArray<TTuple<const FDropdown*, float, float>>& Menus)
+			{
+				UOverlay* Area = Tree->ConstructWidget<UOverlay>(UOverlay::StaticClass(), *(Name + TEXT("Area")));
+				UVerticalBox* Rows = Tree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), *(Name + TEXT("Rows")));
+				UOverlaySlot* RowsSlot = Area->AddChildToOverlay(Rows);
+				RowsSlot->SetHorizontalAlignment(HAlign_Fill);
+				RowsSlot->SetVerticalAlignment(VAlign_Top);
+				Into->AddChildToVerticalBox(Area)->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+				for (const auto& [Dropdown, LeftInset, Width] : Menus)
+				{
+					USizeBox* MenuBox = Tree->ConstructWidget<USizeBox>(USizeBox::StaticClass(), *(FString(Dropdown->Prefix) + TEXT("MenuBox")));
+					MenuBox->SetWidthOverride(Width);
+					MenuBox->SetContent(MakeMenu(*Dropdown));
+					UOverlaySlot* MenuSlot = Area->AddChildToOverlay(MenuBox);
+					MenuSlot->SetHorizontalAlignment(HAlign_Left);
+					MenuSlot->SetVerticalAlignment(VAlign_Top);
+					MenuSlot->SetPadding(FMargin(LeftInset, 0.f, 0.f, 0.f));
+				}
+				Into = Rows;
+			};
+
+			// The paired options, two half rows a line.
+			for (int32 First = 0; First + 1 < PairedOptions; First += 2)
+			{
+				UHorizontalBox* Line = Tree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass(), *FString::Printf(TEXT("OptionLine%d"), First / 2));
+				TArray<TTuple<const FDropdown*, float, float>> Menus;
+				for (int32 Side = 0; Side < 2; ++Side)
+				{
+					const int32 Index = First + Side;
+					UHorizontalBox* Row = MakeRow(*FString::Printf(TEXT("Option%dRow"), Index), OptionNames[Index], ValueOf(Index), HalfLabelWidth, FMargin(0.f));
+					UHorizontalBoxSlot* RowSlot = Line->AddChildToHorizontalBox(Row);
+					RowSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+					RowSlot->SetPadding(FMargin(Side == 0 ? 0.f : PairGap / 2.f, 0.f, Side == 0 ? PairGap / 2.f : 0.f, 0.f));
+					if (const FDropdown* Dropdown = DropdownFor(Index))
+					{
+						Menus.Add(MakeTuple(Dropdown, Side * (HalfWidth + PairGap) + HalfLabelWidth + 2.f, HalfWidth - HalfLabelWidth - 2.f));
+					}
+				}
+				Into->AddChildToVerticalBox(Line)->SetPadding(FMargin(0.f, 0.f, 0.f, 8.f));
+				if (!Menus.IsEmpty()) OpenOver(FString::Printf(TEXT("OptionLine%d"), First / 2), Menus);
+			}
+
+			// The other options, a centred row each.
+			constexpr float CentredLeft = (SeedColumnWidth - CentredRowWidth) / 2.f;
+			for (int32 Index = PairedOptions; Index < UE_ARRAY_COUNT(OptionNames); ++Index)
+			{
+				USizeBox* Width = Tree->ConstructWidget<USizeBox>(USizeBox::StaticClass(), *FString::Printf(TEXT("Option%dWidth"), Index));
+				Width->SetWidthOverride(CentredRowWidth);
+				Width->SetContent(MakeRow(*FString::Printf(TEXT("Option%dRow"), Index), OptionNames[Index], ValueOf(Index), LabelWidth, FMargin(0.f)));
+				UVerticalBoxSlot* WidthSlot = Into->AddChildToVerticalBox(Width);
+				WidthSlot->SetHorizontalAlignment(HAlign_Center);
+				WidthSlot->SetPadding(FMargin(0.f, 0.f, 0.f, 8.f));
+				if (const FDropdown* Dropdown = DropdownFor(Index))
+				{
+					OpenOver(Dropdown->Prefix, {MakeTuple(Dropdown, CentredLeft + LabelWidth + 2.f, CentredRowWidth - LabelWidth - 2.f)});
+				}
+			}
+		}
 
 		// The game's finger cursor, mirrored and turned so its tip is on the mouse. Not named Cursor:
 		// UWidget has a Cursor property.
 		UImage* Cursor = Tree->ConstructWidget<UImage>(UImage::StaticClass(), TEXT("FingerCursor"));
 		Cursor->bIsVariable = true;
-		Cursor->SetBrush(TextureBrush(Finger, FVector2D(CursorSize)));
+		Cursor->SetBrush(TextureBrush(FingerImage, FVector2D(CursorSize)));
 		Cursor->SetVisibility(ESlateVisibility::HitTestInvisible);
 		Cursor->SetRenderTransform(FWidgetTransform(FVector2D(-7.2f, -7.2f), FVector2D(-1.f, 1.f), FVector2D::ZeroVector, 45.f));
 		UCanvasPanelSlot* CursorSlot = Root->AddChildToCanvas(Cursor);
@@ -710,22 +827,25 @@ namespace
 		CursorSlot->SetSize(FVector2D(CursorSize));
 		CursorSlot->SetZOrder(100);
 
-		const FName Seed(TEXT("SeedLabel")), Input(TEXT("SeedInput")), Button(TEXT("ApplyButton")), Zones(TEXT("ZoneList"));
+		const FName Seed(TEXT("SeedLabel")), Input(TEXT("SeedInput")), Button(TEXT("ApplyButton"));
 		Tree->ForEachWidget([Blueprint](UWidget* Widget)
 		{
 			Blueprint->OnVariableAdded(Widget->GetFName());
 		});
 
-		const FName RequestedSeed(TEXT("RequestedSeed")), RequestedZone(TEXT("RequestedZone")), PrevCursor(TEXT("PrevCursor"));
+		const FName RequestedSeed(TEXT("RequestedSeed")), RequestedChoice(TEXT("RequestedChoice")), PrevCursor(TEXT("PrevCursor"));
+		// PendingInput: the game's menu input for the DLL (see InputDirectionCode). MouseMode: set by the DLL
+		// while the mouse is in use, so the finger follows it.
+		const FName PendingInput(TEXT("PendingInput")), MouseMode(TEXT("MouseMode"));
 		FEdGraphPinType StringType;
 		StringType.PinCategory = UEdGraphSchema_K2::PC_String;
 		FEdGraphPinType BoolType;
 		BoolType.PinCategory = UEdGraphSchema_K2::PC_Boolean;
 		if (!FBlueprintEditorUtils::AddMemberVariable(Blueprint, RequestedSeed, StringType)
-			|| !FBlueprintEditorUtils::AddMemberVariable(Blueprint, RequestedZone, IntPinType())
+			|| !FBlueprintEditorUtils::AddMemberVariable(Blueprint, RequestedChoice, IntPinType())
 			|| !FBlueprintEditorUtils::AddMemberVariable(Blueprint, PrevCursor, BoolType)
-			|| !FBlueprintEditorUtils::AddMemberVariable(Blueprint, TEXT("DungeonOpened"), BoolType)
-			|| !FBlueprintEditorUtils::AddMemberVariable(Blueprint, TEXT("FieldOpened"), BoolType))
+			|| !FBlueprintEditorUtils::AddMemberVariable(Blueprint, PendingInput, StringType)
+			|| !FBlueprintEditorUtils::AddMemberVariable(Blueprint, MouseMode, BoolType, TEXT("true")))
 		{
 			throw FBuildError{TEXT("could not add the panel's variables")};
 		}
@@ -758,6 +878,10 @@ namespace
 				return TPair<UK2Node_CallFunction*, UK2Node_CallFunction*>(Create, Place);
 			};
 
+			const auto [CreateDimming, PlaceDimming] = CreateInto(Dimming, TEXT("DimHost"));
+			Build.Then(Construct, CreateDimming);
+			Build.Then(CreateDimming, PlaceDimming);
+
 			// The window reads its title when first built, so it is set before placing it.
 			const auto [CreateWindow, PlaceWindow] = CreateInto(TitleWindow, TEXT("WindowHost"));
 			UK2Node_VariableSet* Title = Build.SetOn(TitleWindow, TitleText);
@@ -768,7 +892,7 @@ namespace
 				throw FBuildError{TEXT("cannot connect the window cast to its TitleText")};
 			}
 			FGraphBuilder::Pin(Title, TitleText)->DefaultTextValue = FText::AsCultureInvariant(TEXT("Randomizer"));
-			Build.Then(Construct, CreateWindow);
+			Build.Then(PlaceDimming, CreateWindow);
 			Build.Then(CreateWindow, Title);
 			Build.Then(Title, PlaceWindow);
 
@@ -807,57 +931,31 @@ namespace
 			return Node;
 		};
 
-		// A chooser toggles its list and closes the other; the battles under an open list are hidden.
-		for (const FZoneListKind& List : ZoneLists)
+		// A dropdown's bar opens and closes its list.
+		for (const FDropdown& Dropdown : Dropdowns)
 		{
-			const FString Name(List.Name);
-			const FName Menu(*(Name + TEXT("Menu")));
-			const FName Select(*(Name + TEXT("Select")));
+			const FString Prefix(Dropdown.Prefix);
+			const FName Select(*(Prefix + TEXT("Select")));
+			const FName Menu(*(Prefix + TEXT("Menu")));
 			UK2Node_ComponentBoundEvent* OnClicked = BoundEvent(Blueprint, Graph, Select, UButton::StaticClass(), GET_MEMBER_NAME_CHECKED(UButton, OnClicked));
 			UK2Node_CallFunction* Sound = Build.PlaySound(SoundCursor);
 			Build.Then(OnClicked, Sound);
-			UEdGraphNode* Last = Sound;
-			for (const FZoneListKind& Other : ZoneLists)
-			{
-				if (&Other == &List) continue;
-				UK2Node_CallFunction* CloseOther = Visibility(*(FString(Other.Name) + TEXT("Menu")), TEXT("Collapsed"));
-				Build.Then(Last, CloseOther);
-				Last = CloseOther;
-			}
 			UK2Node_CallFunction* IsOpen = Build.Call(UWidget::StaticClass(), TEXT("IsVisible"));
 			Build.Target(Menu, IsOpen);
 			UK2Node_IfThenElse* Branch = Build.Branch();
 			Build.Link(IsOpen, Return, Branch, UEdGraphSchema_K2::PN_Condition);
-			Build.Then(Last, Branch);
-			UK2Node_CallFunction* Close = Visibility(Menu, TEXT("Collapsed"));
-			UK2Node_CallFunction* ShowBattles = Visibility(TEXT("ZoneScroll"), TEXT("Visible"));
-			Build.Then(Branch, UEdGraphSchema_K2::PN_Then, Close);
-			Build.Then(Close, ShowBattles);
-			UK2Node_CallFunction* Open = Visibility(Menu, TEXT("Visible"));
-			UK2Node_CallFunction* HideBattles = Visibility(TEXT("ZoneScroll"), TEXT("Hidden"));
-			Build.Then(Branch, UEdGraphSchema_K2::PN_Else, Open);
-			Build.Then(Open, HideBattles);
-			// The first opening starts at the top; later ones keep the scroll.
-			const FName Opened(*(Name + TEXT("Opened")));
-			UK2Node_IfThenElse* First = Build.Branch();
-			Build.Link(Build.Get(Opened), Opened, First, UEdGraphSchema_K2::PN_Condition);
-			UK2Node_CallFunction* ToTop = Build.Call(UScrollBox::StaticClass(), TEXT("ScrollToStart"));
-			Build.Target(*(Name + TEXT("MenuScroll")), ToTop);
-			UK2Node_VariableSet* SetOpened = Build.Set(Opened);
-			Build.Literal(SetOpened, Opened, TEXT("true"));
-			Build.Then(HideBattles, First);
-			Build.Then(First, UEdGraphSchema_K2::PN_Else, ToTop);
-			Build.Then(ToTop, SetOpened);
-
+			Build.Then(Sound, Branch);
+			Build.Then(Branch, UEdGraphSchema_K2::PN_Then, Visibility(Menu, TEXT("Collapsed")));
+			Build.Then(Branch, UEdGraphSchema_K2::PN_Else, Visibility(Menu, TEXT("Visible")));
 			UK2Node_ComponentBoundEvent* OnHovered = BoundEvent(Blueprint, Graph, Select, UButton::StaticClass(), GET_MEMBER_NAME_CHECKED(UButton, OnHovered));
 			Build.Then(OnHovered, Build.PlaySound(SoundCursor));
 		}
 
-		// ChooseZone(Kind, Index): RequestedZone = Kind * 1000 + Index + 1, which the DLL reads and clears.
+		// Choose(Kind, Index): RequestedChoice = Kind * 1000 + Index + 1, which the DLL reads and clears.
 		{
 			FGraphNodeCreator<UK2Node_CustomEvent> Creator(*Graph);
 			UK2Node_CustomEvent* Choose = Creator.CreateNode();
-			Choose->CustomFunctionName = TEXT("ChooseZone");
+			Choose->CustomFunctionName = TEXT("Choose");
 			Creator.Finalize();
 			Choose->CreateUserDefinedPin(TEXT("Kind"), IntPinType(), EGPD_Output);
 			Choose->CreateUserDefinedPin(TEXT("Index"), IntPinType(), EGPD_Output);
@@ -871,33 +969,26 @@ namespace
 			UK2Node_CallFunction* PlusOne = Build.Call(UKismetMathLibrary::StaticClass(), TEXT("Add_IntInt"));
 			Build.Link(Plus, Return, PlusOne, TEXT("A"));
 			Build.Literal(PlusOne, TEXT("B"), TEXT("1"));
-			UK2Node_VariableSet* SetRequest = Build.Set(RequestedZone);
-			Build.Link(PlusOne, Return, SetRequest, RequestedZone);
+			UK2Node_VariableSet* SetRequest = Build.Set(RequestedChoice);
+			Build.Link(PlusOne, Return, SetRequest, RequestedChoice);
 			Build.Then(Choose, SetRequest);
 			UEdGraphNode* Last = SetRequest;
-			for (const FZoneListKind& List : ZoneLists)
+			for (const FDropdown& Dropdown : Dropdowns)
 			{
-				UK2Node_CallFunction* Close = Visibility(*(FString(List.Name) + TEXT("Menu")), TEXT("Collapsed"));
+				UK2Node_CallFunction* Close = Visibility(*(FString(Dropdown.Prefix) + TEXT("Menu")), TEXT("Collapsed"));
 				Build.Then(Last, Close);
 				Last = Close;
 			}
-			UK2Node_CallFunction* ShowBattles = Visibility(TEXT("ZoneScroll"), TEXT("Visible"));
-			UK2Node_CallFunction* Sound = Build.PlaySound(SoundDecide);
-			Build.Then(Last, ShowBattles);
-			Build.Then(ShowBattles, Sound);
+			Build.Then(Last, Build.PlaySound(SoundDecide));
 		}
 
-		// UpdateDisplay(SeedText, DungeonName, FieldName, ZoneText): called by the DLL. The battle list
-		// returns to its top, so a short zone is never scrolled out of sight.
+		// UpdateDisplay(SeedText): called by the DLL.
 		{
 			FGraphNodeCreator<UK2Node_CustomEvent> Creator(*Graph);
 			UK2Node_CustomEvent* Update = Creator.CreateNode();
 			Update->CustomFunctionName = TEXT("UpdateDisplay");
 			Creator.Finalize();
 			Update->CreateUserDefinedPin(TEXT("SeedText"), StringType, EGPD_Output);
-			Update->CreateUserDefinedPin(TEXT("DungeonName"), StringType, EGPD_Output);
-			Update->CreateUserDefinedPin(TEXT("FieldName"), StringType, EGPD_Output);
-			Update->CreateUserDefinedPin(TEXT("ZoneText"), StringType, EGPD_Output);
 
 			const auto SetTextFrom = [&Build, Return](FName Widget, UClass* WidgetClass, UEdGraphNode* Source, FName SourcePin)
 			{
@@ -910,72 +1001,98 @@ namespace
 			};
 			UK2Node_CallFunction* SetSeed = SetTextFrom(Seed, UTextBlock::StaticClass(), Update, TEXT("SeedText"));
 			UK2Node_CallFunction* SetInput = SetTextFrom(Input, UEditableTextBox::StaticClass(), Update, TEXT("SeedText"));
-			UK2Node_CallFunction* SetDungeon = SetTextFrom(TEXT("DungeonSelectText"), UTextBlock::StaticClass(), Update, TEXT("DungeonName"));
-			UK2Node_CallFunction* SetField = SetTextFrom(TEXT("FieldSelectText"), UTextBlock::StaticClass(), Update, TEXT("FieldName"));
-			UK2Node_CallFunction* SetZone = SetTextFrom(Zones, UTextBlock::StaticClass(), Update, TEXT("ZoneText"));
-			UK2Node_CallFunction* ToTop = Build.Call(UScrollBox::StaticClass(), TEXT("ScrollToStart"));
-			Build.Target(TEXT("ZoneScroll"), ToTop);
 			Build.Then(Update, SetSeed);
 			Build.Then(SetSeed, SetInput);
-			Build.Then(SetInput, SetDungeon);
-			Build.Then(SetDungeon, SetField);
-			Build.Then(SetField, SetZone);
-			Build.Then(SetZone, ToTop);
 		}
 
-		// TogglePanel: called by the DLL on F2 and by the panel on Back. Opening shows the panel and
-		// the mouse cursor and gives the UI all input; closing gives everything back.
+		// OnRequestOpen: the game opens the screen. As its own screens do: the parent first, then FinishedOpen.
+		// The mouse cursor's state is kept to give back on closing.
 		{
-			FGraphNodeCreator<UK2Node_CustomEvent> Creator(*Graph);
-			UK2Node_CustomEvent* Toggle = Creator.CreateNode();
-			Toggle->CustomFunctionName = TEXT("TogglePanel");
+			UK2Node_Event* Open = OverrideEvent(Graph, UCPP_EU_WBP_Activatable::StaticClass(), TEXT("OnRequestOpen"));
+			FGraphNodeCreator<UK2Node_CallParentFunction> Creator(*Graph);
+			UK2Node_CallParentFunction* Parent = Creator.CreateNode();
+			Parent->SetFromFunction(UCPP_EU_WBP_Activatable::StaticClass()->FindFunctionByName(TEXT("OnRequestOpen")));
 			Creator.Finalize();
-
-			UK2Node_CallFunction* IsOpen = Build.Call(UWidget::StaticClass(), TEXT("IsVisible"));
-			UK2Node_IfThenElse* Branch = Build.Branch();
-			Build.Link(IsOpen, Return, Branch, UEdGraphSchema_K2::PN_Condition);
-			Build.Then(Toggle, Branch);
-
-			// Open.
 			UK2Node_VariableGet* WasShown = Build.GetOn(APlayerController::StaticClass(), ShowCursor);
 			Build.TargetPlayer(WasShown);
 			UK2Node_VariableSet* Remember = Build.Set(PrevCursor);
 			Build.Link(WasShown, ShowCursor, Remember, PrevCursor);
-			UK2Node_CallFunction* Show = Build.Call(UWidget::StaticClass(), TEXT("SetVisibility"));
-			Build.Literal(Show, TEXT("InVisibility"), TEXT("Visible"));
-			UK2Node_VariableSet* CursorOn = Build.SetOn(APlayerController::StaticClass(), ShowCursor);
-			Build.TargetPlayer(CursorOn);
-			Build.Literal(CursorOn, ShowCursor, TEXT("true"));
-			UK2Node_CallFunction* UIOnly = Build.Call(UWidgetBlueprintLibrary::StaticClass(), TEXT("SetInputMode_UIOnlyEx"));
-			Build.TargetPlayer(UIOnly, TEXT("PlayerController"));
-			Build.Link(Build.Self(), UEdGraphSchema_K2::PN_Self, UIOnly, TEXT("InWidgetToFocus"));
-			Build.Literal(UIOnly, TEXT("InMouseLockMode"), TEXT("DoNotLock"));
-			UK2Node_CallFunction* OpenSound = Build.PlaySound(SoundOpen);
-			Build.Then(Branch, UEdGraphSchema_K2::PN_Else, Remember);
-			Build.Then(Remember, Show);
-			Build.Then(Show, CursorOn);
-			Build.Then(CursorOn, UIOnly);
-			Build.Then(UIOnly, OpenSound);
+			UK2Node_CallFunction* Sound = Build.PlaySound(SoundOpen);
+			UK2Node_CallFunction* Finished = Build.Call(UCPP_EU_WBP_Activatable::StaticClass(), TEXT("FinishedOpen"));
+			Build.Then(Open, Parent);
+			Build.Then(Parent, Remember);
+			Build.Then(Remember, Sound);
+			Build.Then(Sound, Finished);
+		}
 
-			// Close.
-			UK2Node_CallFunction* CloseSound = Build.PlaySound(SoundClose);
-			UK2Node_CallFunction* Hide = Build.Call(UWidget::StaticClass(), TEXT("SetVisibility"));
-			Build.Literal(Hide, TEXT("InVisibility"), TEXT("Collapsed"));
-			UK2Node_CallFunction* GameOnly = Build.Call(UWidgetBlueprintLibrary::StaticClass(), TEXT("SetInputMode_GameOnly"));
-			Build.TargetPlayer(GameOnly, TEXT("PlayerController"));
+		// Closed, by the DLL or the game: the close sound, and the mouse cursor as it was.
+		{
+			UK2Node_Event* Closed = OverrideEvent(Graph, UCommonActivatableWidget::StaticClass(), TEXT("BP_OnDeactivated"));
+			UK2Node_CallFunction* Sound = Build.PlaySound(SoundClose);
 			UK2Node_VariableSet* CursorBack = Build.SetOn(APlayerController::StaticClass(), ShowCursor);
 			Build.TargetPlayer(CursorBack);
 			Build.Link(Build.Get(PrevCursor), PrevCursor, CursorBack, ShowCursor);
-			Build.Then(Branch, UEdGraphSchema_K2::PN_Then, CloseSound);
-			Build.Then(CloseSound, Hide);
-			Build.Then(Hide, GameOnly);
-			Build.Then(GameOnly, CursorBack);
+			Build.Then(Closed, Sound);
+			Build.Then(Sound, CursorBack);
 		}
 
-		// Tick, only while shown: the game hides the mouse cursor on its own, so keep it on, and move
-		// the finger to the mouse.
+		// The game's menu input, queued for the DLL: PendingInput += code + EventType + ",".
+		{
+			const auto Queue = [&](FName Function, int32 Code, bool bDirection)
+			{
+				UK2Node_Event* Input = OverrideEvent(Graph, UCPP_BI_WidgetBasicInput::StaticClass(), Function);
+				UK2Node_CallFunction* Type = Build.Call(UKismetMathLibrary::StaticClass(), TEXT("Conv_ByteToInt"));
+				Build.Link(Input, TEXT("InEventType"), Type, TEXT("InByte"));
+				UK2Node_CallFunction* Sum = Build.Call(UKismetMathLibrary::StaticClass(), TEXT("Add_IntInt"));
+				Build.Link(Type, Return, Sum, TEXT("A"));
+				Build.Literal(Sum, TEXT("B"), FString::FromInt(Code));
+				UK2Node_CallFunction* Total = Sum;
+				if (bDirection)
+				{
+					UK2Node_CallFunction* Direction = Build.Call(UKismetMathLibrary::StaticClass(), TEXT("Conv_ByteToInt"));
+					Build.Link(Input, TEXT("InNavigation"), Direction, TEXT("InByte"));
+					UK2Node_CallFunction* Tens = Build.Call(UKismetMathLibrary::StaticClass(), TEXT("Multiply_IntInt"));
+					Build.Link(Direction, Return, Tens, TEXT("A"));
+					Build.Literal(Tens, TEXT("B"), TEXT("10"));
+					Total = Build.Call(UKismetMathLibrary::StaticClass(), TEXT("Add_IntInt"));
+					Build.Link(Sum, Return, Total, TEXT("A"));
+					Build.Link(Tens, Return, Total, TEXT("B"));
+				}
+				UK2Node_CallFunction* AsText = Build.Call(UKismetStringLibrary::StaticClass(), TEXT("Conv_IntToString"));
+				Build.Link(Total, Return, AsText, TEXT("InInt"));
+				UK2Node_CallFunction* Append = Build.Call(UKismetStringLibrary::StaticClass(), TEXT("Concat_StrStr"));
+				Build.Link(Build.Get(PendingInput), PendingInput, Append, TEXT("A"));
+				Build.Link(AsText, Return, Append, TEXT("B"));
+				UK2Node_CallFunction* Comma = Build.Call(UKismetStringLibrary::StaticClass(), TEXT("Concat_StrStr"));
+				Build.Link(Append, Return, Comma, TEXT("A"));
+				Build.Literal(Comma, TEXT("B"), TEXT(","));
+				UK2Node_VariableSet* Store = Build.Set(PendingInput);
+				Build.Link(Comma, Return, Store, PendingInput);
+				Build.Then(Input, Store);
+			};
+			Queue(TEXT("InputDirection"), InputDirectionCode, true);
+			Queue(TEXT("InputDecide"), InputDecideCode, false);
+			Queue(TEXT("InputCancel"), InputCancelCode, false);
+			Queue(TEXT("InputEscape"), InputEscapeCode, false);
+		}
+
+		// The game's menu sounds, for the DLL to play when the controller moves or chooses.
+		for (const TPair<const TCHAR*, const TCHAR*>& Sound : {TPair<const TCHAR*, const TCHAR*>(TEXT("SoundCursor"), SoundCursor),
+			TPair<const TCHAR*, const TCHAR*>(TEXT("SoundDecide"), SoundDecide)})
+		{
+			FGraphNodeCreator<UK2Node_CustomEvent> Creator(*Graph);
+			UK2Node_CustomEvent* Event = Creator.CreateNode();
+			Event->CustomFunctionName = Sound.Key;
+			Creator.Finalize();
+			Build.Then(Event, Build.PlaySound(Sound.Value));
+		}
+
+		// Tick, only while shown and the mouse is in use: the game hides the mouse cursor on its own, so keep
+		// it on, and move the finger to the mouse.
 		{
 			UK2Node_Event* Tick = OverrideEvent(Graph, UUserWidget::StaticClass(), TEXT("Tick"));
+			UK2Node_IfThenElse* UsingMouse = Build.Branch();
+			Build.Link(Build.Get(MouseMode), MouseMode, UsingMouse, UEdGraphSchema_K2::PN_Condition);
 			UK2Node_VariableSet* CursorOn = Build.SetOn(APlayerController::StaticClass(), ShowCursor);
 			Build.TargetPlayer(CursorOn);
 			Build.Literal(CursorOn, ShowCursor, TEXT("true"));
@@ -987,102 +1104,50 @@ namespace
 			Build.Link(AsCanvasSlot, Return, Move, UEdGraphSchema_K2::PN_Self);
 			Build.Link(Mouse, Return, Move, TEXT("InPosition"));
 			// Not pure: it has to be on the execution chain.
-			Build.Then(Tick, CursorOn);
+			Build.Then(Tick, UsingMouse);
+			Build.Then(UsingMouse, UEdGraphSchema_K2::PN_Then, CursorOn);
 			Build.Then(CursorOn, Mouse);
 			Build.Then(Mouse, Move);
 		}
 
-		// TogglePanel and ChooseZone exist on the class only after this.
+		// Choose exists on the class only after this.
 		FKismetEditorUtilities::CompileBlueprint(Blueprint);
 
-		for (const FZoneListKind& List : ZoneLists)
+		const auto ChooseOnClick = [&](const FString& Button, int32 Kind, int32 Index)
 		{
-			for (int32 Index = 0; Index < List.Entries; ++Index)
+			UK2Node_ComponentBoundEvent* OnClicked = BoundEvent(Blueprint, Graph, *Button, UButton::StaticClass(), GET_MEMBER_NAME_CHECKED(UButton, OnClicked));
+			UK2Node_CallFunction* Choose = Build.Call(Blueprint->SkeletonGeneratedClass, TEXT("Choose"));
+			Build.Literal(Choose, TEXT("Kind"), FString::FromInt(Kind));
+			Build.Literal(Choose, TEXT("Index"), FString::FromInt(Index));
+			Build.Then(OnClicked, Choose);
+		};
+		for (int32 Index = 0; Index < UE_ARRAY_COUNT(OptionNames); ++Index)
+		{
+			if (const FDropdown* Dropdown = DropdownFor(Index))
 			{
-				UK2Node_ComponentBoundEvent* OnClicked = BoundEvent(Blueprint, Graph, *FString::Printf(TEXT("%sItem%d"), List.Name, Index), UButton::StaticClass(), GET_MEMBER_NAME_CHECKED(UButton, OnClicked));
-				UK2Node_CallFunction* Choose = Build.Call(Blueprint->SkeletonGeneratedClass, TEXT("ChooseZone"));
-				Build.Literal(Choose, TEXT("Kind"), FString::FromInt(List.Kind));
-				Build.Literal(Choose, TEXT("Index"), FString::FromInt(Index));
-				Build.Then(OnClicked, Choose);
+				for (int32 Choice = 0; Choice < Dropdown->Choices.Num(); ++Choice)
+				{
+					ChooseOnClick(FString::Printf(TEXT("%sItem%d"), Dropdown->Prefix, Choice), Dropdown->Kind, Choice);
+				}
+				continue;
 			}
+			ChooseOnClick(FString::Printf(TEXT("OptionOn%dButton"), Index), OptionOnKind, Index);
+			ChooseOnClick(FString::Printf(TEXT("OptionOff%dButton"), Index), OptionOffKind, Index);
 		}
 
-		// On Key Down: Back (Escape) closes the panel; any other key is left to the widgets.
+		// Focusable, so the seed box can take the keyboard; and the game's prompts for the panel.
+		UObject* Defaults = Blueprint->GeneratedClass->GetDefaultObject();
+		CastChecked<UUserWidget>(Defaults)->SetIsFocusable(true);
+		FStructProperty* Guide = FindFProperty<FStructProperty>(Blueprint->GeneratedClass, TEXT("ActionGuideTag"));
+		if (!Guide || Guide->Struct != FGameplayTag::StaticStruct())
 		{
-			UEdGraph* Function = OverrideFunction(Blueprint, UUserWidget::StaticClass(), TEXT("OnKeyDown"));
-			FGraphBuilder Override(Function);
-			UK2Node_FunctionEntry* Entry = Override.Find<UK2Node_FunctionEntry>();
-			UK2Node_FunctionResult* Result = Override.Find<UK2Node_FunctionResult>();
-
-			UK2Node_CallFunction* Action = Override.Call(UKismetInputLibrary::StaticClass(), TEXT("Key_GetNavigationActionFromKey"));
-			Override.Link(Entry, TEXT("InKeyEvent"), Action, TEXT("InKeyEvent"));
-			UK2Node_SwitchEnum* Switch = Override.Switch(StaticEnum<EUINavigationAction>());
-			Override.Link(Action, Return, Switch, TEXT("Selection"));
-			UK2Node_CallFunction* Close = Override.Call(Blueprint->SkeletonGeneratedClass, TEXT("TogglePanel"));
-			UK2Node_CallFunction* Handled = Override.Call(UWidgetBlueprintLibrary::StaticClass(), TEXT("Handled"));
-			Override.Link(Handled, Return, Result, Return);
-			Override.Then(Entry, Switch);
-			Override.Then(Switch, TEXT("Back"), Close);
-			Override.Then(Close, Result);
+			throw FBuildError{TEXT("the panel has no ActionGuideTag")};
 		}
-
-		// Focusable, so it gets the keyboard and sees Back.
-		CastChecked<UUserWidget>(Blueprint->GeneratedClass->GetDefaultObject())->SetIsFocusable(true);
+		// A tag the editor's tag list does not have: its name is set as it is, for the game to look up.
+		*Guide->ContainerPtrToValuePtr<FName>(Defaults) = FName(ActionGuideTag);
 
 		CompileAndSave(Blueprint);
 		return Blueprint;
-	}
-
-	void BuildModActor(UWidgetBlueprint* Panel)
-	{
-		UBlueprint* Blueprint = FKismetEditorUtilities::CreateBlueprint(
-			AActor::StaticClass(), NewAssetPackage(TEXT("ModActor")), TEXT("ModActor"), BPTYPE_Normal,
-			UBlueprint::StaticClass(), UBlueprintGeneratedClass::StaticClass());
-
-		const FName PanelVariable(TEXT("Panel"));
-		FEdGraphPinType PanelType;
-		PanelType.PinCategory = UEdGraphSchema_K2::PC_Object;
-		PanelType.PinSubCategoryObject = UUserWidget::StaticClass();
-		if (!FBlueprintEditorUtils::AddMemberVariable(Blueprint, PanelVariable, PanelType))
-		{
-			throw FBuildError{TEXT("could not add Panel")};
-		}
-		FKismetEditorUtilities::CompileBlueprint(Blueprint);
-
-		UEdGraph* Graph = FBlueprintEditorUtils::FindEventGraph(Blueprint);
-		if (!Graph)
-		{
-			throw FBuildError{TEXT("ModActor has no event graph")};
-		}
-		FGraphBuilder Build(Graph);
-		const FName Return = UEdGraphSchema_K2::PN_ReturnValue;
-
-		// BeginPlay: the panel, in the viewport and collapsed.
-		{
-			UK2Node_Event* BeginPlay = EnabledBeginPlay(Blueprint, Graph);
-			UK2Node_CallFunction* Create = Build.Call(UWidgetBlueprintLibrary::StaticClass(), TEXT("Create"));
-			UEdGraphPin* WidgetType = FGraphBuilder::Pin(Create, TEXT("WidgetType"));
-			WidgetType->DefaultObject = Panel->GeneratedClass;
-			Build.TargetPlayer(Create, TEXT("OwningPlayer"));
-
-			UK2Node_VariableSet* SetPanel = Build.Set(PanelVariable);
-			Build.Link(Create, Return, SetPanel, PanelVariable);
-
-			UK2Node_CallFunction* AddToViewport = Build.Call(UUserWidget::StaticClass(), TEXT("AddToViewport"));
-			Build.Target(PanelVariable, AddToViewport);
-			Build.Literal(AddToViewport, TEXT("ZOrder"), TEXT("100"));
-
-			UK2Node_CallFunction* Hide = Build.Call(UWidget::StaticClass(), TEXT("SetVisibility"));
-			Build.Target(PanelVariable, Hide);
-			Build.Literal(Hide, TEXT("InVisibility"), TEXT("Collapsed"));
-
-			Build.Then(BeginPlay, Create);
-			Build.Then(Create, SetPanel);
-			Build.Then(SetPanel, AddToViewport);
-			Build.Then(AddToViewport, Hide);
-		}
-
-		CompileAndSave(Blueprint);
 	}
 }
 
@@ -1090,7 +1155,7 @@ int32 UBuildFFRRandomizerUICommandlet::Main(const FString& Params)
 {
 	try
 	{
-		BuildModActor(BuildPanel());
+		BuildPanel();
 	}
 	catch (const FBuildError& Error)
 	{

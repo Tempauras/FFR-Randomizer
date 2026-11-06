@@ -1,8 +1,8 @@
 using UnrealBuildTool;
 
-public class FFRSModTools : ModuleRules
+public class FFRSRandomizerUI : ModuleRules
 {
-	public FFRSModTools(ReadOnlyTargetRules Target) : base(Target)
+	public FFRSRandomizerUI(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 
@@ -23,6 +23,7 @@ public class FFRSModTools : ModuleRules
 			"CommonUI",
 			"CommonInput",
 			"GameplayTags",
+			"EnhancedUI",
 			"mucha",
 		});
 	}

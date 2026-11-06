@@ -18,12 +18,17 @@
     ],
     "Modules": [
         {
+            "Name": "EnhancedUI",
+            "Type": "Runtime",
+            "LoadingPhase": "Default"
+        },
+        {
             "Name": "mucha",
             "Type": "Runtime",
             "LoadingPhase": "Default"
         },
         {
-            "Name": "FFRSModTools",
+            "Name": "FFRSRandomizerUI",
             "Type": "Editor",
             "LoadingPhase": "Default"
         }
