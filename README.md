@@ -59,3 +59,9 @@ Made this for multiple reason, first to try to make a randomizer because I never
 ## Thanks
 
 Thanks to Kanaruu and his [FFR Modding Tools](https://www.nexusmods.com/finalfantasyresonance/mods/1) on Nexusmod for making FFR Modding Tools and predumping the game files, saved a lot of time
+
+## Disclaimer
+
+Final Fantasy Resonance and all related names, characters and assets belong to their respective rights holders. This is an unofficial fan project, not affiliated with or endorsed by them. It does not include any game files: you need your own copy of the game.
+
+The mod is provided as is. It writes its seed and options into your save, so back up your saves before using it.
