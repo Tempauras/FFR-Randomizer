@@ -5,7 +5,7 @@ namespace ffr
     FFRRandomizer::FFRRandomizer()
     {
         ModName = STR("FFR Randomizer");
-        ModVersion = STR("0.1 ");
+        ModVersion = STR("1.0");
         ModDescription = STR("Seeded battle randomizer");
         ModAuthors = STR("Temporas");
     }
